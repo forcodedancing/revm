@@ -231,7 +231,6 @@ impl<DB: Database> Database for State<DB> {
 
     fn code_by_hash(&mut self, code_hash: B256) -> Result<Bytecode, Self::Error> {
         counter!("cache.code.total_access").increment(1);
-
         let res = match self.cache.contracts.entry(code_hash) {
             hash_map::Entry::Occupied(entry) => {
                 counter!("cache.code.state_cache_state_hit").increment(1);
