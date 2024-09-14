@@ -12,9 +12,10 @@ use std::{
     collections::{btree_map, BTreeMap},
     vec::Vec,
 };
+use metrics::{counter};
 
 /// Database boxed with a lifetime and Send.
-pub type DBBox<'a, E> = Box<dyn Database<Error = E> + Send + 'a>;
+pub type DBBox<'a, E> = Box<dyn Database<Error=E> + Send + 'a>;
 
 /// More constrained version of State that uses Boxed database with a lifetime.
 ///
@@ -83,7 +84,7 @@ impl<DB: Database> State<DB> {
     /// balances must be filtered out before calling this function.
     pub fn increment_balances(
         &mut self,
-        balances: impl IntoIterator<Item = (Address, u128)>,
+        balances: impl IntoIterator<Item=(Address, u128)>,
     ) -> Result<(), DB::Error> {
         // make transition and update cache state
         let mut transitions = Vec::new();
@@ -111,7 +112,7 @@ impl<DB: Database> State<DB> {
     /// It is used for DAO hardfork state change to move values from given accounts.
     pub fn drain_balances(
         &mut self,
-        addresses: impl IntoIterator<Item = Address>,
+        addresses: impl IntoIterator<Item=Address>,
     ) -> Result<Vec<u128>, DB::Error> {
         // make transition and update cache state
         let mut transitions = Vec::new();
@@ -175,6 +176,7 @@ impl<DB: Database> State<DB> {
     /// If the account is not found in the cache, it will be loaded from the
     /// database and inserted into the cache.
     pub fn load_cache_account(&mut self, address: Address) -> Result<&mut CacheAccount, DB::Error> {
+        counter!("cache.account.total_access").increment(1);
         match self.cache.accounts.entry(address) {
             hash_map::Entry::Vacant(entry) => {
                 if self.use_preloaded_bundle {
@@ -182,10 +184,12 @@ impl<DB: Database> State<DB> {
                     if let Some(account) =
                         self.bundle_state.account(&address).cloned().map(Into::into)
                     {
+                        counter!("cache.account.state_bundle_state_hit").increment(1);
                         return Ok(entry.insert(account));
                     }
                 }
                 // if not found in bundle, load it from database
+                counter!("cache.account.state_miss").increment(1);
                 let info = self.database.basic(address)?;
                 let account = match info {
                     None => CacheAccount::new_loaded_not_existing(),
@@ -196,7 +200,10 @@ impl<DB: Database> State<DB> {
                 };
                 Ok(entry.insert(account))
             }
-            hash_map::Entry::Occupied(entry) => Ok(entry.into_mut()),
+            hash_map::Entry::Occupied(entry) => {
+                counter!("cache.account.state_cache_state_hit").increment(1);
+                Ok(entry.into_mut())
+            }
         }
     }
 
@@ -223,16 +230,23 @@ impl<DB: Database> Database for State<DB> {
     }
 
     fn code_by_hash(&mut self, code_hash: B256) -> Result<Bytecode, Self::Error> {
+        counter!("cache.code.total_access").increment(1);
+
         let res = match self.cache.contracts.entry(code_hash) {
-            hash_map::Entry::Occupied(entry) => Ok(entry.get().clone()),
+            hash_map::Entry::Occupied(entry) => {
+                counter!("cache.code.state_cache_state_hit").increment(1);
+                Ok(entry.get().clone())
+            },
             hash_map::Entry::Vacant(entry) => {
                 if self.use_preloaded_bundle {
                     if let Some(code) = self.bundle_state.contracts.get(&code_hash) {
+                        counter!("cache.code.state_bundle_state_hit").increment(1);
                         entry.insert(code.clone());
                         return Ok(code.clone());
                     }
                 }
                 // if not found in bundle ask database
+                counter!("cache.code.state_miss").increment(1);
                 let code = self.database.code_by_hash(code_hash)?;
                 entry.insert(code.clone());
                 Ok(code)
@@ -242,6 +256,7 @@ impl<DB: Database> Database for State<DB> {
     }
 
     fn storage(&mut self, address: Address, index: U256) -> Result<U256, Self::Error> {
+        counter!("cache.storage.total_access").increment(1);
         // Account is guaranteed to be loaded.
         // Note that storage from bundle is already loaded with account.
         if let Some(account) = self.cache.accounts.get_mut(&address) {
@@ -251,13 +266,18 @@ impl<DB: Database> Database for State<DB> {
                 .account
                 .as_mut()
                 .map(|account| match account.storage.entry(index) {
-                    hash_map::Entry::Occupied(entry) => Ok(*entry.get()),
+                    hash_map::Entry::Occupied(entry) => {
+                        counter!("cache.storage.state_hit").increment(1);
+                        Ok(*entry.get())
+                    },
                     hash_map::Entry::Vacant(entry) => {
                         // if account was destroyed or account is newly built
                         // we return zero and don't ask database.
                         let value = if is_storage_known {
+                            counter!("cache.storage.state_known").increment(1);
                             U256::ZERO
                         } else {
+                            counter!("cache.storage.state_miss").increment(1);
                             self.database.storage(address, index)?
                         };
                         entry.insert(value);
@@ -540,14 +560,14 @@ mod tests {
                         slot1,
                         StorageSlot::new_changed(
                             *existing_account_initial_storage.get(&slot1).unwrap(),
-                            U256::from(1_000)
+                            U256::from(1_000),
                         )
                     ),
                     (
                         slot2,
                         StorageSlot::new_changed(
                             *existing_account_initial_storage.get(&slot2).unwrap(),
-                            U256::from(2_000)
+                            U256::from(2_000),
                         )
                     ),
                     // Create new slot
